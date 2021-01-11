@@ -1,0 +1,851 @@
+library(CARBayesST)
+library(CARBayesdata)
+library(sp)
+library(tidyverse)
+library(ggplot2)
+library(spdep)
+library(lubridate)
+library(sf)
+library(tmap)
+library(janitor)
+library(here)
+library(ggridges)
+library(rgdal)
+library(broom)
+library(car)
+library(rmapshaper)
+library(ggdist)
+
+#### PRE-PROCESSING PARTY DATA #### 
+df <- read_csv(here::here('data',
+                          'scotland-house-parties-2020.csv'))
+
+df <- df %>% 
+  clean_names()
+
+#Converting date column to datetime
+df[['date']] <- as.Date(df[['date']], format='%d/%m/%Y') #why did this take so long
+
+#Creating df without non-spatially referenced rows
+df_spatialref <- df %>% 
+  dplyr::filter(!is.na(area_commands))
+
+#Creating table of total house parties attended by date
+#only for visualisation purposes
+house_gatherings_by_date <- df %>% 
+  dplyr::select(date, house_gatherings_attended, house_gatherings_in_breach_of_restrictions) %>% 
+  group_by(date) %>% 
+  summarise_at(c("house_gatherings_attended", "house_gatherings_in_breach_of_restrictions"), sum, na.rm = TRUE) %>% 
+  pivot_longer(cols=2:3,
+               names_to='category',
+               values_to='gathering_count')
+
+#Plotting daily house parties attended and parties recorded as breaching restrictions
+daily_plot <- ggplot(house_gatherings_by_date,
+       aes(x=date, y=gathering_count, fill=category)) +
+  geom_bar(stat='identity') +
+  scale_fill_brewer(palette='Paired',
+                    name="",
+                    labels=c("Total house gatherings attended",
+                             "House gatherings in breach of restrictions")) +
+  xlab('Date') +
+  ylab('Number of house gatherings attended by police') +
+  geom_vline(aes(xintercept = as.Date('2020-09-01'),
+                 linetype='Household visits banned in Glasgow,\nWest Dunbartonshire, and\nEast Renfrewshire'),
+             color='red') +
+  geom_vline(aes(xintercept = as.Date('2020-09-23'),
+                 linetype='Household visits banned nationwide'),
+             color='red') +
+  scale_linetype_manual(name = 'Restrictions introduced',
+                        values = c('Household visits banned in Glasgow,\nWest Dunbartonshire, and\nEast Renfrewshire' = 'dashed',
+                                   'Household visits banned nationwide' = 'solid')) +
+  theme(legend.title=element_blank(),
+        axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)))
+
+
+#Another version of daily plot
+daily_plot <- ggplot(house_gatherings_by_date,
+                     aes(x=date, y=gathering_count, fill=category)) +
+  geom_bar(stat='identity') +
+  scale_fill_brewer(palette='Paired',
+                    name="",
+                    labels=c("Total house gatherings attended",
+                             "House gatherings in breach of restrictions")) +
+  xlab('Date') +
+  ylab('Number of house gatherings attended by police') +
+  geom_vline(aes(xintercept = as.Date('2020-09-01')),
+                 linetype='dashed',
+             color='red') +
+  geom_vline(aes(xintercept = as.Date('2020-09-23')),
+             linetype='solid',
+             color='red') +
+  annotate("text", x = as.Date('2020-09-02'),
+           y = 295,
+           size = 3,
+           label = "Household gatherings banned in\nGlasgow, West Dunbartonshire,\nand East Renfrewshire",
+           colour='red',
+           hjust=0) +
+  annotate("text", x = as.Date('2020-09-24'),
+           y = 298,
+           size = 3,
+           label = "Household gatherings banned\nnationwide",
+           colour='red',
+           hjust=0) +
+  theme(legend.title=element_blank(),
+        axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)))
+
+daily_plot
+
+ggsave('daily_plot2.png', plot=daily_plot, height = 21 , width = 33.87, units='cm')
+
+#Creating table of house gatherings by week in each area command
+#this will be used for analysis later
+area_command_house_gatherings_weekly <- df_spatialref %>% 
+  dplyr::select(date, area_commands, house_gatherings_in_breach_of_restrictions) %>% 
+  mutate(week = floor_date(date, unit="week", week_start=getOption('lubridate.week.start', 5))) %>% 
+  group_by(week, area_commands) %>%
+  summarise_at("house_gatherings_in_breach_of_restrictions", sum, na.rm = TRUE) %>% 
+  dplyr::filter(week != as.Date('2020-10-09') & area_commands != 'Western Isles') %>% 
+  dplyr::filter(area_commands != 'Orkney') %>% 
+  dplyr::filter(area_commands != 'Shetland')
+
+#### CONSTRUCTING LOOKUP TABLE ####
+
+#Read in lookup table
+lookup <- read_csv(here::here('data',
+                              'Datazone2011lookup.csv'))
+
+#Read in population data for electoral wards
+wardpop <- read_csv(here::here('data',
+                               'electoral-wards-19-tabs',
+                               'electoral-wards-19-tabs_2019.csv'), skip = 3)
+
+#We only want the ward population data for all ages, not split by gender
+wardpop <- wardpop %>% 
+  clean_names() %>% 
+  dplyr::filter((sex == 'Persons') & (area_name != 'Scotland'))
+
+#dealing with duplicated ward names in different councils
+wardpop[268, 'area_name'] <- "North East (Glasgow)"
+wardpop[269, 'area_name'] <- "North Isles (Orkney)"
+wardpop[270, 'area_name'] <- "North Isles (Shetland)"
+
+#Join ward name to local authority, adding information on population aged 18-29 in the process
+agecols = c('x18', 'x19', 'x20', 'x21', 'x22', 'x23', 'x24', 'x25', 'x26', 'x27', 'x28', 'x29')
+
+wardpop_la <- left_join(wardpop,
+                        lookup,
+                        by=c("area_code" = "MMWard_Code")) %>% 
+  dplyr::select(c(area_code, area_name, all_ages, x18, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29, LA_Code, LA_Name, SPD_Code, SPD_Name)) %>% 
+  distinct(area_code, .keep_all=TRUE) %>% 
+  mutate(pop_18_29 = rowSums(.[agecols]))
+
+#Function for processing raw text pasted from Police Scotland website
+create_ward_list <- function(string) {
+  string <- str_split(string, "\\n")
+  for (i in 1:length(string)) {
+    string[[i]] <- str_replace(string[[i]], "&", "and")
+    string[[i]] <- str_replace(string[[i]], "(:|-|–).*", "")
+    string[[i]] <- str_replace(string[[i]], "\\s(([[:graph:]]+@[[:graph:]]+)( /\\s+[[:graph:]]+@[[:graph:]]+)?)", "")
+    string[[i]] <- str_replace(string[[i]], "\\s+$", "")
+  }
+  return(unlist(string)) #turn list output into character vector
+}
+
+#Function for processing wards where area commands covers one council
+council_ward_list <- function(council) {
+  wards <- wardpop_la %>% 
+    dplyr::filter(LA_Name == council) %>% 
+    pull(area_name)
+  return(wards)
+}
+
+#Create lookup list
+area_commands.levels <- stack(list(
+  'Aberdeen City North' = c('Dyce/Bucksburn/Danestone', 
+                            'Bridge of Don',
+                            'Kingswells/Sheddocksley/Summerhill',
+                            'Northfield/Mastrick North',
+                            'Hilton/Woodside/Stockethill',
+                            'Tillydrone/Seaton/Old Aberdeen',
+                            'George St/Harbour'),
+  'Aberdeen City South' = c('Midstocket/Rosemount',
+                            'Lower Deeside',
+                            'Hazlehead/Queens Cross/Countesswells',
+                            'Airyhall/Broomhill/Garthdee',
+                            'Torry/Ferryhill',
+                            'Kincorth/Nigg/Cove'),
+  'Aberdeenshire North' = create_ward_list('Banff and District - BanffDistrictCPT@Scotland.pnn.police.uk
+Troup - TroupCPT@scotland.pnn.police.uk
+Fraserburgh and District - FraserburghDistrictCPT@scotland.pnn.police.uk
+Central Buchan - CentralBuchanCPT@Scotland.pnn.police.uk
+Peterhead North and Rattray - PeterheadNorthRattrayCPT@Scotland.pnn.police.uk
+Peterhead South and Cruden - PeterheadSouthCrudenCPT@Scotland.pnn.police.uk
+Turriff and District - TurriffDistrictCPT@Scotland.pnn.police.uk
+Mid Formartine - MidFormartineCPT@Scotland.pnn.police.uk
+Ellon and District - EllonDistrictCPT@Scotland.pnn.police.uk'),
+  'Aberdeenshire South' = create_ward_list('West Garioch - WestGariochCPT@Scotland.pnn.police.uk
+Inverurie and District - InverurieDistrictCPT@Scotland.pnn.police.uk
+East Garioch - EastGariochCPT@Scotland.pnn.police.uk
+Westhill and District - WesthillDistrictCPT@Scotland.pnn.police.uk
+Huntly, Strathbogie and Howe of Alford - HuntlyStrathbogieHoweofAlfordCPT@Scotland.pnn.police.uk
+Aboyne, Upper Deeside and Donside - AboyneUpperDeesideDonsideCPT@Scotland.pnn.police.uk
+Banchory and Mid Deeside - BanchoryMidDeesideCPT@Scotland.pnn.police.uk
+North Kincardine - NorthKincardineCPT@Scotland.pnn.police.uk
+Stonehaven and Lower Deeside - StonehavenLowerDeesideCPT@Scotland.pnn.police.uk
+Mearns - MearnsCPT@Scotland.pnn.police.uk'),
+  'Angus' = council_ward_list('Angus'),
+  'Central' = create_ward_list('Kirkcaldy Central
+Kirkcaldy East
+Kirkcaldy North
+Burntisland, Kinghorn and Western Kirkcaldy
+Glenrothes West and Kinglassie
+Glenrothes Central and Thornton
+Glenrothes North, Leslie and Markinch'),
+  'Clackmannanshire' = create_ward_list('Clackmannanshire East - ClackmannanshireEastCPT@scotland.pnn.police.uk
+Clackmannanshire North - ClackmannanshireNorthCPT@scotland.pnn.police.uk
+Clackmannanshire South - ClackmannanshireSouthCPT@scotland.pnn.police.uk
+Clackmannanshire West - ClackmannanshireWestCPT@scotland.pnn.police.uk
+Clackmannanshire Central'),
+  'Dumfriesshire' = create_ward_list('North West Dumfries
+Mid and Upper Nithsdale
+Lochar
+Nith
+Annandale South
+Annandale North
+Annandale East and Eskdale'),
+  'Dundee' = council_ward_list('Dundee City'),
+  'East' = create_ward_list('Tay Bridgehead
+St. Andrews
+East Neuk and Landward
+Cupar
+Howe of Fife and Tay Coast
+Leven, Kennoway and Largo
+Buckhaven, Methil and Wemyss Villages'),
+  'East Ayrshire' = create_ward_list('Annick – AyrshireLPSTAnnick@scotland.pnn.police.uk
+Kilmarnock North – AyrshireLPSETKilmarnock@scotland.pnn.police.uk
+Kilmarnock West and Crosshouse – AyrshireLPSTKilmarnock@scotland.pnn.police.uk
+Kilmarnock East and Hurlford - AyrshireLPSTKilmarnock@scotland.pnn.police.uk
+Hurlford - AyrshireLPSTIrvineValley@scotland.pnn.police.uk
+Kilmarnock South – AyrshireLPSTKilmarnock@scotland.pnn.police.uk
+Irvine Valley – AyrshireLPSTIrvineValley@scotland.pnn.police.uk
+Ballochmyle – AyrshireLPSTCumnock@scotland.pnn.uk
+Cumnock and New Cumnock – AyrshireLPSTCumnock@scotland.pnn.police.uk
+Doon Valley – AyrshireLPSTDoonValley@scotland.pnn.police.uk'),
+  'East Dunbartonshire' = create_ward_list('Milngavie
+Bearsden North
+Bearsden South
+Bishopbriggs North and Campsie
+Bishopbriggs South
+Lenzie and Kirkintilloch South
+Kirkintilloch East and North and Twechar'),
+  'East Kilbride, Cambuslang and Rutherglen' = create_ward_list('East Kilbride Central North
+East Kilbride Central South
+East Kilbride West
+East Kilbride South
+East Kilbride East
+Rutherglen Central and North
+Rutherglen South
+Cambuslang East
+Cambuslang West'),
+  'East Lothian' = create_ward_list('Musselburgh - MusselburghWestCPT@scotland.pnn.police.uk, MusselburghEastCarberryCPT@scotland.pnn.police.uk
+Preston, Seton and Gosford - PrestonSetonCPT@scotland.pnn.police.uk
+Tranent, Wallyford and Macmerry - FasideCPT@scotland.pnn.police.uk
+Haddington and Lammermuir - HaddingtonLammermuirCPT@scotland.pnn.police.uk
+North Berwick Coastal - NorthBerwickCoastalCPT@scotland.pnn.police.uk
+Dunbar and East Linton - DunbarEastLintonCPT@scotland.pnn.police.uk'),
+  'East Renfrewshire' = create_ward_list('Barrhead, Liboside and Uplawmoor
+Newton Mearns North and Neilston
+Giffnock and Thornliebank
+Clarkston, Netherlee and Williamwood
+Newton Mearns South and Eaglesham'),
+  'Falkirk' = create_ward_list("Bo'ness and Blackness - Bo'NessBlacknessCPT@scotland.pnn.police.uk
+Bonnybridge and Larbert - BonnybridgeLarbertCPT@scotland.pnn.police.uk
+Carse, Kinnaird and Tryst - CarseKinnairdTrystCPT@scotland.pnn.police.uk
+Denny and Banknock - DennyBanknockCPT@scotland.pnn.police.uk
+Falkirk North - FalkirkNorthCPT@scotland.pnn.police.uk
+Falkirk South - FalkirkSouthCPT@scotland.pnn.police.uk
+Grangemouth - GrangemouthCPT@scotland.pnn.police.uk
+Lower Braes - LowerBraesCPT@scotland.pnn.police.uk
+Upper Braes - UpperBraesCPT@Scotland.pnn.police.uk"),
+  'Galloway' = create_ward_list('Stranraer and the Rhins
+Mid Galloway and Wigtown West
+Dee and Glenkens
+Castle Douglas and Crocketford
+Abbey'),
+  'Glasgow City Centre' = 'Anderston/City/Yorkhill',
+  'Glasgow East' = create_ward_list('Calton GreaterGlasgowLPSTLondonRoad@scotland.pnn.police.uk
+East Centre GreaterGlasgowLPSTLondonRoad@scotland.pnn.police.uk
+Dennistoun'), #figured out that Dennistoun was in Glasgow East by looking up the ward councillor's FB page
+  'Glasgow North' = create_ward_list('Maryhill
+Canal
+Springburn/Robroyston'),
+  'Glasgow North East' = c("Baillieston",
+                           "Shettleston",
+                           "North East (Glasgow)"), #figured out Glasgow NE wards through process of elimination
+  'Glasgow North West' = create_ward_list('Hillhead - GreaterGlasgowLPSTPartick@scotland.pnn.police.uk
+Victoria Park - GreaterGlasgowLPSTDrumchapel@scotland.pnn.police.uk
+Garscadden/Scotstounhill - GreaterGlasgowLPSTDrumchapel@scotland.pnn.police.uk
+Drumchapel/Anniesland - GreaterGlasgowLPSTDrumchapel@scotland.pnn.police.uk
+Partick East/Kelvindale - GreaterGlasgowLPSTPartick@scotland.pnn.police.uk'),
+  'Glasgow South East' = create_ward_list('Linn - GreaterGlasgowLPSTCathcart@scotland.pnn.police.uk
+Pollokshields - GreaterGlasgowLPSTGorbals@scotland.pnn.police.uk
+Langside - GreaterGlasgowLPSTCathcart@scotland.pnn.police.uk
+Southside Central - GreaterGlasgowLPSTGorbals@scotland.pnn.police.uk'),
+  'Glasgow South West' = create_ward_list('Newlands/Auldburn GreaterGlasgowLPSTPollok@scotland.pnn.police.uk
+Greater Pollok GreaterGlasgowLPSTPollok@scotland.pnn.police.uk
+Cardonald GreaterGlasgowLPSTGovan@scotland.pnn.police.uk
+Govan GreaterGlasgowLPSTGovan@scotland.pnn.police.uk'),
+  'Hamilton & Clydesdale' = create_ward_list('Hamilton North and East
+Hamilton South
+Hamilton West and Earnock
+Larkhall
+Avondale and Stonehouse
+Blantyre
+Bothwell and Uddingston
+Clydesdale North
+Clydesdale East
+Clydesdale South
+Clydesdale West'),
+  'Inverclyde' = create_ward_list('Inverclyde East: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde East Central: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde North: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde South: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde West: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde South West: RenfrewshireInverclydeLPSTGreenock@Scotland.pnn.police.uk
+Inverclyde Central'),
+  'Inverness' = c('Aird and Loch Ness',
+                  'Culloden and Ardersier',
+                  'Inverness South',
+                  'Inverness Millburn',
+                  'Inverness Ness-side',
+                  'Inverness Central',
+                  'Inverness West'),
+  'Mid-Argyll, Kintyre, Oban, Lorn and the Islands' = create_ward_list('Oban North and Lorn ObanNorthLornCPT@scotland.pnn.police.uk
+Oban South and the Isles ObanSouthTheIslesCPT@scotland.pnn.police.uk
+South Kintyre SouthKintyreCPT@scotland.pnn.police.uk
+Kintyre and the Islands KintyreTheIslandsCPT@scotland.pnn.police.uk
+Mid Argyll midargyllcpt@scotland.pnn.police.uk'),
+  'Midlothian' = council_ward_list('Midlothian'),
+  'Monklands & Cumbernauld' = create_ward_list('Airdrie Central
+Airdrie North
+Airdrie South
+Gartcosh, Glenboig and Moodiesburn
+Coatbridge South
+Coatbridge West
+Coatbridge North
+Cumbernauld North
+Kilsyth
+Cumbernauld South
+Stepps, Chryston and Muirhead
+Cumbernauld East'),
+  'Moray' = create_ward_list('Speyside Glenlivet - SpeysideGlenlivetCPT@Scotland.pnn.police.uk
+Keith and Cullen - KeithCullenCPT@Scotland.pnn.police.uk
+Buckie - BuckieCPT@Scotland.pnn.police.uk
+Fochabers Lhanbryde - FochabersLhanbrydeCPT@Scotland.pnn.police.uk
+Heldon and Laich - HeldonLaichCPT@Scotland.pnn.police.uk
+Elgin City North - ElginCityNorthCPT@Scotland.pnn.police.uk
+Elgin City South - ElginCitySouthCPT@Scotland.pnn.police.uk
+Forres - ForresCPT@Scotland.pnn.police.uk'),
+  'Motherwell, Wishaw and Bellshill' = create_ward_list('Motherwell South East and Ravenscraig
+Wishaw
+Murdostoun
+Motherwell West
+Motherwell North
+Fortissat
+Thorniewood
+Bellshill
+Mossend and Holytown'),
+  'North Ayrshire' = create_ward_list('Irvine West – AyrshireLPSTIrvine@scotland.pnn.police.uk
+Irvine East – AyrshireLPSTIrvine@scotland.pnn.police.uk
+Kilwinning – AyrshireLPSTKilwinning@scotland.pnn.police.uk
+Stevenston – AyrshireLPST3Towns@scotland.pnn.police.uk / AyrshireLPSTArran@scotland.pnn.police.uk
+Ardrossan and Arran - AyrshireLPST3Towns@scotland.pnn.police.uk / AyrshireLPSTArran@scotland.pnn.police.uk
+Dalry & West Kilbride - AyrshireLPSTGarnockValley@scotland.pnn.police.uk /  AyrshireLPSTNorthCoast&Cumbraes@scotland.pnn.police.uk
+Kilbirnie & Beith – AyrshireLPSTGarnockVAlley@scotland.pnn.police.uk
+North Coast & Cumbraes - AyrshireLPSTNorthCoast&Cumbraes@scotland.pnn.police.uk
+Irvine South – AyrshireLPSTIrvine@scotland.pnn.police.uk
+Saltcoats – AyrshireLPST3Towns@Scotland.pnn.police.uk / AyrshireLPSTArran@scotland.pnn.police.uk'),
+  'North East' = create_ward_list('Leith
+Leith Walk
+Craigentinny/Duddingston
+Portobello/Craigmillar'),
+  'North Highlands' = c('Thurso and Northwest Caithness',
+                        'Wick and East Caithness',
+                        'North, West and Central Sutherland',
+                        'East Sutherland and Edderton',
+                        'Wester Ross, Strathpeffer and Lochalsh',
+                        'Cromarty Firth',
+                        'Tain and Easter Ross',
+                        'Dingwall and Seaforth',
+                        'Black Isle'),
+  'North West' = create_ward_list('Almond
+Drum Brae/Gyle
+Corstorphine/Murrayfield
+Forth
+Inverleith'),
+  'Orkney' = council_ward_list('Orkney Islands'),
+  'Paisley' = create_ward_list('Paisley East and Central: RenfrewshireInverclydeLPSTPaisley@Scotland.pnn.police.uk
+Paisley Northwest: RenfrewshireInverclydeLPSTPaisley@Scotland.pnn.police.uk
+Paisley Southeast: RenfrewshireInverclydeLPSTPaisley@Scotland.pnn.police.uk
+Paisley Northeast and Ralston: RenfrewshireInverclydeLPSTPaisley@Scotland.pnn.police.uk
+Paisley Southwest'),
+  'Perth & Kinross' = council_ward_list('Perth and Kinross'),
+  'Renfrew' = create_ward_list('Renfrew North and Braehead: RenfrewshireInverclydeLPSTRenfrew@Scotland.pnn.police.uk
+Renfrew South and Gallowhill: RenfrewshireInverclydeLPSTRenfrew@Scotland.pnn.police.uk
+Johnstone South and Elderslie: RenfrewshireInverclydeLPSTJohnstone@Scotland.pnn.police.uk
+Johnstone North, Kilbarchan, Howwood and Lochwinnoch: RenfrewshireInverclydeLPSTJohnstone@Scotland.pnn.police.uk
+Houston, Crosslee and Linwood RenfrewshireInverclydeLPSTJohnstone@Scotland.pnn.police.uk
+Bishopton, Bridge of Weir and Langbank: RenfrewshireInverclydeLPSTJohnstone@Scotland.pnn.police.uk
+Erskine and Inchinnan: RenfrewshireInverclydeLPSTRenfrew@Scotland.pnn.police.uk'), 
+  'Scottish Borders' = council_ward_list('Scottish Borders'),
+  'Shetland' = council_ward_list('Shetland Islands'),
+  'South Argyll, Helensburgh, Lomond, Bute and Cowal.' = create_ward_list('Cowal - CowalCPT@scotland.pnn.police.uk
+Dunoon - DunoonCPT@scotland.pnn.police.uk
+Isle of Bute - IsleofButeCPT@scotland.pnn.police.uk
+Lomond North - LomondNorthCPT@scotland.pnn.police.uk
+Helensburgh Central - HelensburghCentralCPT@scotland.pnn.police.uk
+Helensburgh and Lomond South - HelensburghLomondSouthCPT@scotland.pnn.police.uk'),
+  'South Ayrshire' = create_ward_list('Troon – AyrshireLPSTTroon@scotland.pnn.police.uk
+Prestwick – AyrshireLPSTPrestwick@scotland.pnn.police.uk
+Ayr North – AyrshireLPSTAyrNorth@scotland.pnn.police.uk
+Ayr East – AyrshireLPSTSouthCoylton@scotland.pnn.police.uk
+Ayr West – AyrshireLPSTSouthCoylton@scotland.pnn.police.uk
+Symington and Monkton -  AyrshireLPSTPrestwick@scotland.pnn.police.uk
+Tarbolton, Mossblow, Craigie, Failford and St Quivox - AyrshireLPSTAyrNorth@scotland.pnn.police.uk
+Maybole, North Carrick & Coylton – AyrshireLPSTMayboleNorthCarrick@scotland.pnn.police.uk or AyrshireLPSTGirvanSouthCarrick@scotland.pnn.police.uk
+Girvan & South Carrick - AyrshireLPSTMayboleNorthCarrick@scotland.pnn.police.uk
+Kyle'),
+  'South East' = create_ward_list('City Centre
+Morningside
+Southside/Newington
+Liberton/Gilmerton'),
+  'South Highlands' = c("Caol and Mallaig",
+                        "Fort William and Ardnamurchan",
+                        "Eilean a'Cheo",
+                        "Badenoch and Strathspey",
+                        "Nairn and Cawdor"),
+  'South West' = create_ward_list('Pentland Hills
+Sighthill/Gorgie
+Colinton/Fairmilehead
+Fountainbridge/Craiglockhart'),
+  'Stirling' = create_ward_list('Bannockburn - BannockburnCPT@Scotland.pnn.police.uk
+Dunblane and Bridge of Allan - DunblaneBridgeofAllanCPT@scotland.pnn.police.uk
+Forth and Endrick - ForthEndrickCPT@scotland.pnn.police.uk
+Stirling East - StirlingEastCPT@Scotland.pnn.police.uk
+Stirling North - StirlingNorthCPT@Scotland.pnn.police.uk
+Stirling West - StirlingWestCPT@Scotland.pnn.police.uk
+Trossachs and Teith - TrossachsTeithCPT@scotland.pnn.police.uk'),
+  'West' = create_ward_list('Dunfermline South DunfermlineSouthCPT@Scotland.pnn.police.uk
+Dunfermline Central DunfermlineCentralCPT@Scotland.pnn.police.uk
+Dunfermline North DunfermlineNorthCPT@Scotland.pnn.police.uk
+Cowdenbeath CowdenbeathCPT@Scotland.pnn.police.uk
+The Lochs TheLochsCPT@Scotland.pnn.police.uk
+Lochgelly, Cardenden and Benarty LochgellyCardendenCPT@Scotland.pnn.police.uk
+West Fife & Coastal Villages WestFifeCoastalVillagesCPT@scotland.pnn.police.uk
+Rosyth RosythCPT@Scotland.pnn.police.uk
+Inverkeithing & Dalgety Bay InverkeithingDalgetyBayCPT@Scotland.pnn.police.uk'),
+  'West Dumbartonshire' = create_ward_list('Clydebank Central - ClydebankCentralCPT@scotland.pnn.police.uk
+Clydebank Waterfront - ClydebankWaterfrontCPT@scotland.pnn.police.uk
+Kilpatrick - KilpatrickCPT@scotland.pnn.police.uk
+Dumbarton - DumbartonCPT@scotland.pnn.police.uk
+Leven - LevenCPT@scotland.pnn.police.uk
+Lomond – lomondCPT@scotland.pnn.police.uk'),
+  'West Lothian' = council_ward_list('West Lothian'),
+  'Western Isles' = council_ward_list('Na h-Eileanan Siar')
+))
+
+#Join wards to area commands using lookup table
+wardpop_area_commands <- wardpop_la %>% 
+  dplyr::select(area_name, area_code, all_ages, pop_18_29, SPD_Name) %>% 
+  left_join(., area_commands.levels, by=c("area_name"="values")) %>% 
+  dplyr::rename(area_commands=ind) %>% 
+  mutate(all_ages = as.numeric(gsub(',', '', all_ages))) #not dropping islands yet bc i need them for an accurate estimate of police officers per area command
+
+#Find number of house parties per 100,000 residents
+area_command_pop <- wardpop_area_commands %>% 
+  group_by(area_commands) %>% 
+  summarise_at(c('all_ages', 'pop_18_29'), sum, na.rm=TRUE) %>%
+  mutate(pc_18_29 = (pop_18_29/all_ages)*100) %>% 
+  dplyr::select(area_commands, all_ages, pc_18_29) %>% 
+  dplyr::filter(area_commands != 'Western Isles') %>% 
+  dplyr::filter(area_commands != 'Orkney') %>% 
+  dplyr::filter(area_commands != 'Shetland')
+
+#Control variable - number of police officers per 10,000 residents
+SPD_lookup <- wardpop_area_commands %>% 
+  dplyr::select(SPD_Name, area_commands) %>% 
+  distinct(area_commands, .keep_all=TRUE)
+
+police_officers <- SPD_lookup %>% 
+  group_by(SPD_Name) %>% 
+  summarise(area_command_count = n_distinct(area_commands)) %>% 
+  mutate(police_officer_count = case_when(
+    SPD_Name == 'North East' ~ 1103, #local police officer counts used bc they reflect police officers who would respond to house parties
+    SPD_Name == 'Tayside' ~ 916,
+    SPD_Name == 'Highlands and Islands' ~ 652,
+    SPD_Name == 'Forth Valley' ~ 641,
+    SPD_Name == 'Edinburgh' ~ 1125,
+    SPD_Name == 'The Lothians and Scottish Borders' ~ 907,
+    SPD_Name == 'Fife' ~ 775,
+    SPD_Name == 'Greater Glasgow' ~ 2452,
+    SPD_Name == 'Ayrshire' ~ 831,
+    SPD_Name == 'Lanarkshire' ~ 1385,
+    SPD_Name == 'Argyll and West Dunbartonshire' ~ 553,
+    SPD_Name == 'Renfrewshire and Inverclyde' ~ 611,
+    SPD_Name == 'Dumfries and Galloway' ~ 401
+  )) %>% 
+  mutate(police_officers_per_area_command = floor(police_officer_count/area_command_count))
+
+police_by_area_command <- SPD_lookup %>% 
+  left_join(., police_officers, by='SPD_Name') %>% 
+  dplyr::select(area_commands, police_officers_per_area_command) %>% 
+  dplyr::filter(area_commands != 'Western Isles') %>% 
+  dplyr::filter(area_commands != 'Orkney') %>% 
+  dplyr::filter(area_commands != 'Shetland')
+
+#Create df of ALL area commands per week
+#a) vector of weeks, each repeated 51 times
+weeks <- area_command_house_gatherings_weekly %>% 
+  distinct(week) %>% 
+  pull() %>% 
+  rep(., each=49)
+
+#b) vector of area commands, the whole set repeated 6 times (number of weeks)
+areas <- area_command_pop %>% 
+  dplyr::select(area_commands) %>% 
+  #dplyr::filter(area_commands != 'Western Isles') %>% 
+  #dplyr::filter(area_commands != 'Orkney') %>% 
+  #dplyr::filter(area_commands != 'Shetland') %>% 
+  pull() %>% 
+  rep(., 6)
+
+#c) concatenate two vectors into data frame
+area_command_gatherings_per_100k <- data.frame(weeks, areas) %>% 
+  dplyr::rename(week = weeks,
+                area_commands = areas)
+
+#Storing dates for constructing regulation dummy variables
+glasgow_ban_date <- as.Date('2020-09-01')
+scotland_ban_date <- as.Date('2020-09-23')
+
+area_command_gatherings_per_100k <- area_command_gatherings_per_100k %>% 
+  merge(.,
+        area_command_house_gatherings_weekly,
+        by.x=c('week', 'area_commands'),
+        by.y=c('week', 'area_commands'),
+        all=TRUE) %>% 
+  replace_na(list(house_gatherings_in_breach_of_restrictions = 0)) %>% 
+  left_join(., area_command_pop, by="area_commands") %>%
+  mutate(illegal_gatherings_rate = (house_gatherings_in_breach_of_restrictions / all_ages)*100000, #only for visualisation
+         pop_over_100k = all_ages/100000, #used as offset in regression analysis
+         household_visits_banned = case_when(
+           week >= glasgow_ban_date & grepl('Glasgow|East Renfrewshire|West Dumbartonshire', area_commands) ~ 1,
+           week >= scotland_ban_date ~ 1,
+           TRUE ~ 0 #the reference level is a restriction on house gatherings of over 15 people
+         )) %>% 
+  left_join(., police_by_area_command, by="area_commands") %>% 
+  mutate(police_per_10k = floor((police_officers_per_area_command/all_ages)*10000))
+
+#Plotting variation in house gatherings per week
+weekly_plot <- ggplot(area_command_gatherings_per_100k, aes(x = as.factor(week), y=illegal_gatherings_rate)) +
+  geom_boxplot(fill='#1f78b4', color='#12486C', lwd=0.25) +
+  xlab('Week (first day shown)') +
+  ylab('Number of house gatherings breaching restrictions\nper 100,000 residents') +
+  theme(axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)))
+
+weekly_plot 
+ggsave('weekly_plot.png', plot=weekly_plot, height = 21 , width = 33.87, units='cm')
+#histogram shows that every week, the rates of house gatherings are positively skewed
+#variance increases with the median, suggesting a poisson process
+#should be noted that the numbers are very low
+
+#### MAPPING ####
+#Load in ward boundaries and merge them into area commands
+#will need it as an sp object later, but sf is easier to work with
+area_commands_sf <- st_read(here::here('data',
+                                       'bdline_essh_gb',
+                                       'Data',
+                                       'GB',
+                                       'district_borough_unitary_ward_region.shp')) %>% 
+  filter(str_detect(CODE, "^S13")) %>% 
+  left_join(.,
+            wardpop_area_commands,
+            by=c("CODE"="area_code")) %>% 
+  group_by(area_commands) %>% 
+  summarise() %>% 
+  dplyr::filter(area_commands != 'Western Isles') %>% 
+  dplyr::filter(area_commands != 'Orkney') %>% 
+  dplyr::filter(area_commands != 'Shetland')
+
+st_write(area_commands_sf, here::here('data',
+                                      'area_commands.geojson'))
+
+#With premade GeoJSON file
+area_commands_sf <- st_read(here::here('data',
+                                       'area_commands.geojson'))
+
+#Convert to sp and join area command illegal gatherings data
+area_commands_sp <- area_commands_sf %>% 
+  as(., "Spatial") 
+
+#### REGRESSION ANALYSIS ####
+
+#Find mean for each areal unit over the time period 
+mean_weekly_gatherings <- area_command_gatherings_per_100k %>% 
+  group_by(area_commands) %>% 
+  summarise_at('illegal_gatherings_rate', mean)
+
+#Create summary statistics table
+area_command_pop <- area_command_pop %>% 
+  left_join(.,
+            mean_weekly_gatherings,
+            by="area_commands") %>% 
+  left_join(., 
+            police_by_area_command,
+            by="area_commands") 
+
+summary(area_command_pop)
+
+#Map summary statistics
+area_commands_sf <- area_commands_sf %>% 
+  dplyr::select(!(c(area, police_per_km2)))
+
+#Simplify outline, because it's not important for this stage and it takes forever
+simple_area_commands_sf <- area_commands_sf %>% 
+  ms_simplify(.,keep=0.05)
+
+#Bring population attributes into simplified sf object
+simple_area_commands_sf <- simple_area_commands_sf %>% 
+  left_join(.,
+            area_command_pop,
+            by="area_commands")
+
+tmap_mode('plot')
+party_map <- tm_shape(simple_area_commands_sf) +
+  tm_fill(col = 'illegal_gatherings_rate',
+          style = 'quantile',
+          palette = 'PuBu',
+          legend.hist = TRUE,
+          title = "",
+          legend.format = list(fun=function(x) paste0(formatC(x, digits=2, format="f")))) +
+  tm_borders(col = 'white', lwd = 0.5, alpha = 0.6) +
+  tm_layout(legend.hist.height = 0.2,
+            legend.hist.width = 0.3,
+            title = 'Mean rate of parties\nper 100,000 residents',
+            title.fontface = 2,
+            legend.text.size = 0.7) +
+  tm_scale_bar(position = c(0.6,0.02), text.size = 0.6) +
+  tm_compass(north=0, position=c(0.9, 0.9))
+
+age_map <- tm_shape(simple_area_commands_sf) +
+  tm_fill(col = 'pc_18_29',
+          style='quantile',
+          palette = 'YlOrBr',
+          legend.hist = TRUE,
+          title="",
+          legend.format = list(fun=function(x) paste0(formatC(x, digits=2, format="f"))),
+          legend.position = c('left', 'bottom')) +
+  tm_borders(col = 'white', lwd = 0.5, alpha = 0.6) +
+  tm_layout(legend.hist.height = 0.2,
+            legend.hist.width = 0.3,
+            title = '% aged 18-29',
+            title.fontface = 2,
+            legend.text.size = 0.7) +
+  tm_scale_bar(position = c(0.6,0.02), text.size = 0.6) +
+  tm_compass(north=0, position=c(0.9, 0.9))
+
+var_maps <- tmap_arrange(party_map, age_map, ncol=2)
+var_maps
+
+tmap_save(var_maps, 'var_maps.png', width=12.46, height=7)
+
+#Join mean weekly gatherings per area command to sp data frame
+#order is v important! the order of polygons in the sp data frame MUST match the order of spatial units in mean data frame
+area_commands_sp@data$mean_weekly_gatherings <- mean_weekly_gatherings$illegal_gatherings_rate
+
+#Create binary spatial weights matrix using sp dataframe
+weights.nb <- poly2nb(area_commands_sp, row.names=mean_weekly_gatherings$area_commands)
+weights <- nb2mat(weights.nb, style='B')
+
+#Create vector of unique weeks
+unique_weeks <- unique(weeks)
+
+#### RESULTS - TIME W NO OTHER VARIABLES ####
+
+#Run regression analysis using temporal data, with spatial weights matrix from sp object
+formula1 <- house_gatherings_in_breach_of_restrictions ~ offset(log(pop_over_100k)) + police_officers_per_area_command
+
+chain1 <- ST.CARsepspatial(formula=formula1,
+                           family='poisson',
+                           data=area_command_gatherings_per_100k,
+                           W=weights,
+                           burnin=3000,
+                           n.sample=450000,
+                           thin=100)
+print(chain1)
+summary(chain1$samples)
+
+#beta = coefficients for covariates
+#phi = spatial random effect for each time period to account for autocorrelation
+#tau2 = spatial variance for each time period
+#delta = overall temporal trend
+#rho.S and rho.T = spatial and temporal autcorrelation parameters (common to all time periods)
+
+#in bayesian inference, parameters are assumed to be drawn from prior distributions
+#normally, the prior distribution of these parameters is constructed using existing knowledge on potential effect sizes, e.g. through systematic reviews
+#for the autocorrelation parameters, the CAR.sepspatial model assumes a 'flat' distribution - no external information is included when calculating these parameters
+#for the spatial variance parameters, a conjugate prior distribution is used -
+#the posterior distribution is assumed to be the prior
+
+#Visualising median rate over time
+#create data frame of each temporal unit, with a column corresponding to the fitted median,
+#lower + upper credibility intervals
+trend.median <- data.frame(Week=unique_weeks, array(NA, c(6,3))) #first number is the number of temporal units
+colnames(trend.median) <- c("Week", "Median", "LCI", "UCI")
+
+#Visualising spatial SD over time
+#create another data frame
+trend.sd <- data.frame(Week=unique_weeks, array(NA, c(6,3)))
+colnames(trend.sd) <- c("Week", "Median", "LCI", "UCI")
+
+#Populate data frames using data from model
+for(i in 1:6) { #i in the range of temporal units
+  #create posterior distribution of estimated rates across space for each year through matrix addition
+  posterior <- exp(chain1$samples$phi[ , ((i-1) * 49 + 1):(i * 49)] +
+                     #samples$phi is a matrix, with rows corresponding to number of samples
+                     #and columns corresponding to number of spatial units for each year i
+                     #e.g. for the first week, the code will extract all the phi samples generated for each spatial unit
+                     matrix(rep(chain1$samples$beta[,1] + chain1$samples$beta[,2] + chain1$samples$delta[ , i], 49),
+                            ncol=49, byrow=FALSE))
+                    #all beta samples are added to the delta samples for year i and repeated 271 times (rows of matrix)
+                    #number of columns is the number of areal units
+  #posterior is the matrix of phi + beta + delta for each spatial unit in year i?
+  trend.median[i, 2:4] <- quantile(apply(posterior, 1, mean), 
+                                   c(0.5, 0.025, 0.975))
+  #apply(posterior, 1, mean) finds the mean of each row in the posterior mean matrix for that year
+  #quantile() finds the median, lower credibility interval, and upper credibility interval for all the means 
+  trend.sd[i, 2:4] <- quantile(apply(posterior, 1, sd),
+                               c(0.5, 0.025, 0.975))
+}
+
+trend.median_long <- trend.median %>% 
+  pivot_longer(cols=2:4,
+               names_to='category',
+               values_to='estimate') %>% 
+  mutate(category = gsub('UCI|LCI', 'CI', category))
+
+#Plot median over time
+medianplot <- ggplot(aes(x = factor(week), y = illegal_gatherings_rate),
+                     data=area_command_gatherings_per_100k) +
+  geom_jitter(color='#1f78b4') +
+  scale_x_discrete(name = "Week (first day shown)") +
+  scale_y_continuous(name = "Rate of illegal house gatherings") +
+  geom_line(data=trend.median, mapping=aes(x=factor(Week), y=Median,
+                                             group=1), colour='#990000', lwd=1) +
+  geom_line(data=trend.median, mapping=aes(x=factor(Week), y=LCI,
+                                             group=1), lwd=0.5, linetype='dashed', colour='black') +
+  geom_line(data=trend.median, mapping=aes(x=factor(Week), y=UCI,
+                                             group=1), lwd=0.5, linetype='dashed', colour='black') +
+  theme(axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)),
+        title = element_text(margin=margin(b=10), face='bold')) +
+  ggtitle('Predicted mean rate of illegal house gatherings\nper 100,000 residents')
+medianplot
+
+ggsave('medianplot.png', plot=medianplot, width=16.33, height=7)
+
+#Plot SD over time
+sdplot <- ggplot() +
+  scale_x_discrete(name = "Year") +
+  scale_y_continuous(name = "Spatial standard deviation") +
+  geom_line(data=trend.sd, mapping=aes(x=factor(Week), y=Median,
+                                         group=1), colour='#990000', lwd=1) +
+  geom_line(data=trend.sd, mapping=aes(x=factor(Week), y=LCI,
+                                         group=1), lwd=0.5, linetype='dashed', colour='black') +
+  geom_line(data=trend.sd, mapping=aes(x=factor(Week), y=UCI,
+                                         group=1), lwd=0.5, linetype='dashed', colour='black') +
+  theme(axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)),
+        plot.title = element_text(margin=margin(b=10), face='bold')) +
+  ggtitle('Standard deviation of estimated mean rates')
+
+sdplot
+ggsave('sdplot.png', plot=sdplot, width=16.33, height=7)
+
+
+#### RESULTS - W COEFFICIENTS ####
+
+#Model with coefficients
+formula2 <- house_gatherings_in_breach_of_restrictions ~ offset(log(pop_over_100k)) + police_per_10k + pc_18_29 + household_visits_banned
+
+chain2 <- ST.CARsepspatial(formula=formula2,
+                           family='poisson',
+                           data=area_command_gatherings_per_100k,
+                           W=weights,
+                           burnin=3000,
+                           n.sample=450000,
+                           thin=100)
+print(chain2)
+summary(chain2$samples)
+
+#Visualising median rate over time
+#create data frame of each temporal unit, with a column corresponding to the fitted median,
+#lower + upper credibility intervals
+trend.median2 <- data.frame(Week=unique_weeks, array(NA, c(6,3))) #first number is the number of temporal units
+colnames(trend.median2) <- c("Week", "Median", "LCI", "UCI")
+
+#Visualising spatial SD over time
+#create another data frame
+trend.sd2 <- data.frame(Week=unique_weeks, array(NA, c(6,3)))
+colnames(trend.sd2) <- c("Week", "Median", "LCI", "UCI")
+
+#Populate data frames using data from model
+for(i in 1:6) { #i in the range of temporal units
+  #create posterior distribution of estimated rates across space for each year through matrix addition
+  posterior2 <- exp(chain2$samples$phi[ , ((i-1) * 49 + 1):(i * 49)] +
+                     #samples$phi is a matrix, with rows corresponding to number of samples
+                     #and columns corresponding to number of spatial units for each year i
+                     #e.g. for the first week, the code will extract all the phi samples generated for each spatial unit
+                     matrix(rep(chain2$samples$beta[,1] + chain2$samples$beta[,2] + chain2$samples$beta[,3] + chain2$samples$beta[,4] + chain2$samples$delta[ , i], 49),
+                            ncol=49, byrow=FALSE))
+  #all beta samples are added to the delta samples for year i and repeated 271 times (rows of matrix)
+  #number of columns is the number of areal units
+  #posterior is the matrix of phi + beta + delta for each spatial unit in year i?
+  trend.median2[i, 2:4] <- quantile(apply(posterior2, 1, mean), 
+                                   c(0.5, 0.025, 0.975))
+  #apply(posterior, 1, mean) finds the mean of each row in the posterior mean matrix for that year
+  #quantile() finds the median, lower credibility interval, and upper credibility interval for all the means 
+  trend.sd2[i, 2:4] <- quantile(apply(posterior2, 1, sd),
+                               c(0.5, 0.025, 0.975))
+}
+
+#Plot median over time
+medianplot2 <- ggplot(aes(x = factor(week), y = illegal_gatherings_rate),
+                     data=area_command_gatherings_per_100k) +
+  geom_jitter(color='#1f78b4') +
+  scale_x_discrete(name = "Week (first day shown)") +
+  scale_y_continuous(name = "Rate of illegal house gatherings") +
+  geom_line(data=trend.median2, mapping=aes(x=factor(Week), y=Median,
+                                           group=1), colour='#990000', lwd=1) +
+  geom_line(data=trend.median2, mapping=aes(x=factor(Week), y=LCI,
+                                           group=1), lwd=0.5, linetype='dashed', colour='black') +
+  geom_line(data=trend.median2, mapping=aes(x=factor(Week), y=UCI,
+                                           group=1), lwd=0.5, linetype='dashed', colour='black') +
+  theme(axis.title.x = element_text(margin = margin(t=10)),
+        axis.title.y = element_text(margin = margin(r=10)),
+        title = element_text(margin=margin(b=10), face='bold')) +
+  ggtitle('Predicted mean rate of illegal house gatherings\nper 100,000 residents')
+
+medianplot2
+ggsave('medianplot2.png', plot=medianplot2, width=16.33, height=7)
+
+
+#variable coefficients would be interpreted as the percent change in y for a unit change in x
+#e to the power of the coefficient would give the ratio of y with predictor value x+1 to y with predictor value x
+#e.g. if the coefficient were -0.0047, e^-0.0047 would be 0.995, 
+#meaning that for a one unit change in x, the corresponding value of y would be 99.5% of the preceding value
+#or, more intuitively, 0.5% lower 
